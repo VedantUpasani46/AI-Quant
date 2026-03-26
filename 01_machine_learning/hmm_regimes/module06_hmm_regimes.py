@@ -1,541 +1,682 @@
 """
-Hidden Markov Model (HMM) + Gaussian Mixture Model (GMM) for Regime Detection
-==============================================================================
-Target: 3-5 Regimes | 85%+ Classification Accuracy
+Hidden Markov Model for Market Regime Detection
+================================================
+Target: Regime prediction accuracy 70%+ | Transition lag < 5 days
 
-This module implements HMM and GMM for detecting market regimes, enabling
-regime-conditional strategies with 85%+ classification accuracy and
-significant alpha enhancement in regime transitions.
-
-Why Regime Detection Matters:
-  - STRATEGY SWITCHING: Different strategies work in different regimes
-  - RISK MANAGEMENT: Reduce leverage in high-volatility regimes
-  - ALPHA ENHANCEMENT: Mean-reversion works in range-bound, momentum in trends
-  - TAIL RISK: Early detection of crisis regimes
-  - PORTFOLIO CONSTRUCTION: Regime-conditional optimization
-
-Target: 3-5 regimes with 85%+ classification accuracy
+This module implements a full Gaussian HMM with the Baum-Welch (EM) algorithm
+for unsupervised market regime detection.
 
 Mathematical Foundation:
 ------------------------
-Hidden Markov Model:
-  States: S = {s_1, ..., s_K}  [latent regimes]
-  Observations: O = {o_1, ..., o_T}  [returns, vol, etc.]
+HMM Components:
+  π_i  = P(state_0 = i)                  [initial probabilities]
+  A_ij = P(state_t = j | state_{t-1} = i) [transition matrix]
+  B_i(x)= N(x; μ_i, Σ_i)                [Gaussian emission per state]
 
-  Transition: P(s_t = j | s_{t-1} = i) = A_{ij}
-  Emission: P(o_t | s_t = i) = B_i(o_t)
-  Initial: π_i = P(s_1 = i)
+Forward variable:  α_t(i) = P(o_1..o_t, s_t=i | λ)
+Backward variable: β_t(i) = P(o_{t+1}..o_T | s_t=i, λ)
 
-Viterbi Algorithm (most likely state sequence):
-  δ_t(i) = max_{s_1,...,s_{t-1}} P(s_1,...,s_{t-1}, s_t=i, o_1,...,o_t)
-  ψ_t(i) = argmax_{j} δ_{t-1}(j) · A_{ji}
+Baum-Welch E-step:
+  γ_t(i)  = α_t(i)β_t(i) / Σ_j α_t(j)β_t(j)
+  ξ_t(i,j)= α_t(i)A_ij B_j(o_{t+1}) β_{t+1}(j) / Σ_{i,j}(same)
 
-Gaussian Mixture Model:
-  p(x) = Σ_k π_k · N(x | μ_k, Σ_k)
-  where π_k = mixture weight, N = Gaussian
+Baum-Welch M-step:
+  π_i^new  = γ_1(i)
+  A_ij^new = Σ_{t=1}^{T-1} ξ_t(i,j) / Σ_{t=1}^{T-1} γ_t(i)
+  μ_i^new  = Σ_t γ_t(i) o_t / Σ_t γ_t(i)
+  Σ_i^new  = Σ_t γ_t(i)(o_t - μ_i)(o_t - μ_i)^T / Σ_t γ_t(i)
 
-Expectation-Maximization (EM):
-  E-step: Compute responsibilities γ(z_{nk})
-  M-step: Update μ_k, Σ_k, π_k
+Viterbi decoding (most likely state sequence):
+  δ_t(i) = max_{s_1..s_{t-1}} P(s_1..s_{t-1}, s_t=i, o_1..o_t | λ)
+  ψ_t(i) = argmax_j [δ_{t-1}(j) A_ji]
 
 References:
-  - Rabiner (1989). A Tutorial on Hidden Markov Models. Proc. IEEE.
-  - Bishop (2006). Pattern Recognition and Machine Learning. Chapter 9 (Mixture Models).
-  - Ang & Bekaert (2002). Regime Switches in Interest Rates. JBF.
-  - Kritzman et al. (2012). Regime Shifts: Implications for Dynamic Strategies. FAJ.
+  - Rabiner (1989). A Tutorial on Hidden Markov Models. IEEE.
+  - Hamilton (1989). A New Approach to the Economic Analysis of Nonstationary Time Series. Econometrica.
+  - Ang & Timmermann (2012). Regime Changes and Financial Markets. Annual Review.
 """
 
 import numpy as np
 import pandas as pd
-from scipy.stats import multivariate_normal
-from sklearn.mixture import GaussianMixture
-from dataclasses import dataclass
+from scipy.stats import spearmanr, multivariate_normal
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
 
-# NOTE: Production uses hmmlearn or statsmodels
-# pip install hmmlearn
-# This demo implements simplified HMM/GMM
+# Optional: hmmlearn for production validation
+try:
+    from hmmlearn.hmm import GaussianHMM
+    HMMLEARN_AVAILABLE = True
+except ImportError:
+    HMMLEARN_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
-# Hidden Markov Model (Simplified)
+# Core HMM with Full Baum-Welch EM
 # ---------------------------------------------------------------------------
 
-class SimplifiedHMM:
+class GaussianHMM_BaumWelch:
     """
-    Simplified Hidden Markov Model for regime detection.
+    Gaussian Hidden Markov Model trained via Baum-Welch (EM).
 
-    States represent market regimes (e.g., bull, bear, crisis, recovery).
-    Observations are market features (returns, volatility, correlation).
+    Each state emits observations from a multivariate Gaussian:
+      B_i(o) = N(o; μ_i, Σ_i)
 
-    Production: Use hmmlearn.hmm.GaussianHMM
-    Demo: Simplified Viterbi algorithm implementation.
+    This is a from-scratch implementation. For production use,
+    hmmlearn.hmm.GaussianHMM is recommended (same math, faster C backend).
     """
 
-    def __init__(self, n_states: int = 4):
+    def __init__(self, n_states: int = 3, covariance_type: str = 'full',
+                 n_iter: int = 100, tol: float = 1e-4, random_state: int = 42):
         self.n_states = n_states
-
-        # Model parameters (initialized randomly, then trained)
-        self.transition_matrix = None  # A: P(s_t | s_{t-1})
-        self.emission_params = None    # B: Parameters of emission distributions
-        self.initial_probs = None      # π: P(s_1)
-
+        self.covariance_type = covariance_type
+        self.n_iter = n_iter
+        self.tol = tol
+        self.random_state = random_state
         self.is_fitted = False
 
-    def fit(self, observations: np.ndarray, n_iter: int = 50):
+        # Model parameters (set during fit)
+        self.initial_probs: Optional[np.ndarray] = None   # π, shape (K,)
+        self.transition_matrix: Optional[np.ndarray] = None  # A, shape (K,K)
+        self.emission_params: List[Dict] = []              # [{mean, cov}, ...]
+        self.log_likelihood_history: List[float] = []
+
+    # ------------------------------------------------------------------
+    # Emission probability helpers
+    # ------------------------------------------------------------------
+
+    def _log_emission_probs(self, observations: np.ndarray) -> np.ndarray:
+        """
+        Compute log P(o_t | state=i) for all t and i.
+
+        Returns:
+            log_B: shape (T, K)  — log Gaussian density
+        """
+        T = len(observations)
+        log_B = np.zeros((T, self.n_states))
+        for k in range(self.n_states):
+            mu = self.emission_params[k]['mean']
+            cov = self.emission_params[k]['cov']
+            try:
+                rv = multivariate_normal(mean=mu, cov=cov, allow_singular=True)
+                log_B[:, k] = rv.logpdf(observations)
+            except Exception:
+                # Fallback: diagonal approximation
+                diff = observations - mu
+                var = np.diag(cov).clip(1e-8)
+                log_B[:, k] = -0.5 * np.sum((diff ** 2) / var, axis=1)
+        return log_B
+
+    # ------------------------------------------------------------------
+    # Forward algorithm (log-scale for numerical stability)
+    # ------------------------------------------------------------------
+
+    def _forward(self, log_B: np.ndarray) -> Tuple[np.ndarray, float]:
+        """
+        Forward algorithm in log space.
+
+        Args:
+            log_B: (T, K) log emission probabilities
+
+        Returns:
+            log_alpha: (T, K)
+            log_likelihood: scalar
+        """
+        T, K = log_B.shape
+        log_alpha = np.full((T, K), -np.inf)
+
+        # t=0
+        log_alpha[0] = np.log(self.initial_probs + 1e-300) + log_B[0]
+
+        # t=1..T-1
+        log_A = np.log(self.transition_matrix + 1e-300)
+        for t in range(1, T):
+            # log_alpha[t, j] = log Σ_i exp(log_alpha[t-1,i] + log_A[i,j])  + log_B[t,j]
+            prev = log_alpha[t - 1][:, np.newaxis] + log_A  # (K, K)
+            log_alpha[t] = self._logsumexp(prev, axis=0) + log_B[t]
+
+        log_likelihood = self._logsumexp(log_alpha[-1])
+        return log_alpha, log_likelihood
+
+    # ------------------------------------------------------------------
+    # Backward algorithm (log-scale)
+    # ------------------------------------------------------------------
+
+    def _backward(self, log_B: np.ndarray) -> np.ndarray:
+        """
+        Backward algorithm in log space.
+
+        Returns:
+            log_beta: (T, K)
+        """
+        T, K = log_B.shape
+        log_beta = np.full((T, K), -np.inf)
+        log_beta[-1] = 0.0  # log(1)
+
+        log_A = np.log(self.transition_matrix + 1e-300)
+        for t in range(T - 2, -1, -1):
+            # log_beta[t, i] = log Σ_j exp(log_A[i,j] + log_B[t+1,j] + log_beta[t+1,j])
+            vals = log_A + log_B[t + 1][np.newaxis, :] + log_beta[t + 1][np.newaxis, :]  # (K, K)
+            log_beta[t] = self._logsumexp(vals, axis=1)
+
+        return log_beta
+
+    # ------------------------------------------------------------------
+    # Logsumexp helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _logsumexp(a: np.ndarray, axis: Optional[int] = None) -> np.ndarray:
+        """Numerically stable log-sum-exp."""
+        a_max = np.max(a, axis=axis, keepdims=True)
+        out = np.log(np.sum(np.exp(a - a_max), axis=axis)) + np.squeeze(a_max, axis=axis)
+        return out
+
+    # ------------------------------------------------------------------
+    # E-step: compute γ and ξ
+    # ------------------------------------------------------------------
+
+    def _e_step(self, observations: np.ndarray, log_B: np.ndarray
+                ) -> Tuple[np.ndarray, np.ndarray, float]:
+        """
+        E-step: compute posterior state probabilities.
+
+        Returns:
+            gamma:  (T, K)   — P(state_t=i | obs, λ)
+            xi:     (T-1, K, K) — P(state_t=i, state_{t+1}=j | obs, λ)
+            log_likelihood: scalar
+        """
+        T, K = log_B.shape
+        log_alpha, log_likelihood = self._forward(log_B)
+        log_beta = self._backward(log_B)
+        log_A = np.log(self.transition_matrix + 1e-300)
+
+        # γ_t(i) = α_t(i) β_t(i) / P(O|λ)
+        log_gamma = log_alpha + log_beta
+        log_gamma -= self._logsumexp(log_gamma, axis=1, keepdims=True)
+        gamma = np.exp(log_gamma)  # (T, K)
+
+        # ξ_t(i,j) for t=0..T-2
+        xi = np.zeros((T - 1, K, K))
+        for t in range(T - 1):
+            # log ξ_t(i,j) = log_alpha[t,i] + log_A[i,j] + log_B[t+1,j] + log_beta[t+1,j]
+            log_xi_t = (log_alpha[t][:, np.newaxis]
+                        + log_A
+                        + log_B[t + 1][np.newaxis, :]
+                        + log_beta[t + 1][np.newaxis, :])
+            log_xi_t -= self._logsumexp(log_xi_t.ravel())
+            xi[t] = np.exp(log_xi_t)
+
+        return gamma, xi, log_likelihood
+
+    # ------------------------------------------------------------------
+    # M-step: re-estimate parameters
+    # ------------------------------------------------------------------
+
+    def _m_step(self, observations: np.ndarray,
+                gamma: np.ndarray, xi: np.ndarray):
+        """
+        M-step: update π, A, μ_k, Σ_k using soft counts.
+        """
+        T, D = observations.shape
+        K = self.n_states
+
+        # Update π
+        self.initial_probs = gamma[0] / (gamma[0].sum() + 1e-300)
+
+        # Update A
+        A_num = xi.sum(axis=0)  # (K, K)
+        self.transition_matrix = A_num / (A_num.sum(axis=1, keepdims=True) + 1e-300)
+
+        # Update emission parameters
+        for k in range(K):
+            gamma_k = gamma[:, k]  # (T,)
+            denom = gamma_k.sum() + 1e-300
+
+            # Mean
+            mu_k = (gamma_k[:, np.newaxis] * observations).sum(axis=0) / denom
+
+            # Covariance
+            diff = observations - mu_k  # (T, D)
+            cov_k = (gamma_k[:, np.newaxis, np.newaxis]
+                     * diff[:, :, np.newaxis]
+                     * diff[:, np.newaxis, :]).sum(axis=0) / denom
+            # Regularise
+            cov_k += np.eye(D) * 1e-6
+
+            self.emission_params[k] = {'mean': mu_k, 'cov': cov_k}
+
+    # ------------------------------------------------------------------
+    # Initialisation
+    # ------------------------------------------------------------------
+
+    def _initialise(self, observations: np.ndarray):
+        """K-means warm start for emission parameters."""
+        T, D = observations.shape
+        np.random.seed(self.random_state)
+
+        kmeans = KMeans(n_clusters=self.n_states, random_state=self.random_state,
+                        n_init=10)
+        labels = kmeans.fit_predict(observations)
+
+        self.emission_params = []
+        for k in range(self.n_states):
+            mask = labels == k
+            obs_k = observations[mask] if mask.sum() > 1 else observations
+            mu = obs_k.mean(axis=0)
+            cov = np.cov(obs_k.T) if obs_k.shape[0] > 1 else np.eye(D)
+            if cov.ndim == 0:
+                cov = np.array([[float(cov)]])
+            cov = np.atleast_2d(cov) + np.eye(D) * 1e-4
+            self.emission_params.append({'mean': mu, 'cov': cov})
+
+        # Transition: high self-persistence
+        self.transition_matrix = np.ones((self.n_states, self.n_states)) * 0.1
+        np.fill_diagonal(self.transition_matrix, 0.7)
+        self.transition_matrix /= self.transition_matrix.sum(axis=1, keepdims=True)
+
+        self.initial_probs = np.ones(self.n_states) / self.n_states
+
+    # ------------------------------------------------------------------
+    # Public API: fit
+    # ------------------------------------------------------------------
+
+    def fit(self, observations: np.ndarray, n_iter: Optional[int] = None):
         """
         Fit HMM using Baum-Welch (EM) algorithm.
 
-        Simplified: Use K-means for initialization + manual EM.
-        Production: Use hmmlearn.hmm.GaussianHMM.fit()
+        Args:
+            observations: (T, D) array of observations
+            n_iter: override default iteration count
         """
-        T, D = observations.shape  # T timesteps, D dimensions
+        T, D = observations.shape
+        n_iter = n_iter or self.n_iter
 
-        print(f"\n  Training HMM...")
+        print(f"\n  Training HMM (Baum-Welch EM)...")
         print(f"    States: {self.n_states}")
         print(f"    Observations: {T} timesteps × {D} features")
-        print(f"    Iterations: {n_iter}")
+        print(f"    Max iterations: {n_iter}  |  Tolerance: {self.tol}")
 
-        # Initialize with K-means clustering
-        from sklearn.cluster import KMeans
-        kmeans = KMeans(n_clusters=self.n_states, random_state=42, n_init=10)
-        labels = kmeans.fit_predict(observations)
+        self._initialise(observations)
+        self.log_likelihood_history = []
 
-        # Initialize emission parameters (Gaussian per state)
-        self.emission_params = []
-        for k in range(self.n_states):
-            state_obs = observations[labels == k]
-            if len(state_obs) > 0:
-                mu = state_obs.mean(axis=0)
-                sigma = np.cov(state_obs.T) + np.eye(D) * 1e-6
-            else:
-                mu = observations.mean(axis=0)
-                sigma = np.eye(D)
-            self.emission_params.append({'mean': mu, 'cov': sigma})
+        prev_ll = -np.inf
+        for iteration in range(n_iter):
+            # ---- E-step ----
+            log_B = self._log_emission_probs(observations)
+            gamma, xi, log_likelihood = self._e_step(observations, log_B)
 
-        # Initialize transition matrix (uniform + self-persistence)
-        self.transition_matrix = np.ones((self.n_states, self.n_states)) * 0.1
-        for i in range(self.n_states):
-            self.transition_matrix[i, i] = 0.7  # Self-persistence
-        self.transition_matrix /= self.transition_matrix.sum(axis=1, keepdims=True)
+            self.log_likelihood_history.append(log_likelihood)
 
-        # Initialize initial probabilities
-        self.initial_probs = np.ones(self.n_states) / self.n_states
+            # ---- Convergence check ----
+            delta = log_likelihood - prev_ll
+            if iteration > 0 and abs(delta) < self.tol:
+                print(f"    Converged at iteration {iteration + 1}  "
+                      f"(ΔlogL={delta:.6f})")
+                break
+            prev_ll = log_likelihood
 
-        # Simplified EM (few iterations, demo purposes)
-        for iteration in range(min(n_iter, 10)):
-            # E-step: Compute forward-backward probabilities (simplified)
-            # M-step: Update parameters
-            # Skipped for demo (use hmmlearn in production)
-            pass
+            if (iteration + 1) % 10 == 0:
+                print(f"    Iter {iteration + 1:3d} | logL = {log_likelihood:.4f}")
+
+            # ---- M-step ----
+            self._m_step(observations, gamma, xi)
 
         self.is_fitted = True
-
-        print(f"    Training complete.")
-        print(f"\n    Transition Matrix (P(state_t | state_t-1)):")
+        print(f"\n    Final log-likelihood: {log_likelihood:.4f}")
+        print(f"\n    Transition Matrix (A_ij = P(state_j | state_i)):")
         for i in range(self.n_states):
-            print(f"      State {i+1}: {self.transition_matrix[i]}")
+            row = "  ".join(f"{v:.3f}" for v in self.transition_matrix[i])
+            print(f"      State {i + 1}: [{row}]")
+
+    # ------------------------------------------------------------------
+    # Public API: predict (Viterbi)
+    # ------------------------------------------------------------------
 
     def predict(self, observations: np.ndarray) -> np.ndarray:
         """
-        Predict most likely state sequence using Viterbi algorithm.
+        Decode most likely state sequence via Viterbi algorithm.
 
         Returns:
-            states: Array of state indices (0 to n_states-1)
+            states: (T,) array of state indices in {0, …, K-1}
         """
         if not self.is_fitted:
-            raise ValueError("Model must be fitted before prediction")
+            raise RuntimeError("Call fit() before predict().")
 
         T = len(observations)
+        K = self.n_states
 
-        # Viterbi variables
-        delta = np.zeros((T, self.n_states))  # Max probability
-        psi = np.zeros((T, self.n_states), dtype=int)  # Backpointer
+        log_B = self._log_emission_probs(observations)      # (T, K)
+        log_A = np.log(self.transition_matrix + 1e-300)     # (K, K)
 
-        # Initialization (t=0)
-        for i in range(self.n_states):
-            delta[0, i] = self.initial_probs[i] * self._emission_prob(observations[0], i)
+        # Initialise Viterbi
+        delta = np.full((T, K), -np.inf)
+        psi = np.zeros((T, K), dtype=int)
 
-        # Recursion (t=1 to T-1)
+        delta[0] = np.log(self.initial_probs + 1e-300) + log_B[0]
+
         for t in range(1, T):
-            for j in range(self.n_states):
-                probs = delta[t-1] * self.transition_matrix[:, j]
-                psi[t, j] = np.argmax(probs)
-                delta[t, j] = np.max(probs) * self._emission_prob(observations[t], j)
+            # δ_t(j) = max_i [δ_{t-1}(i) + log A_ij] + log B_j(o_t)
+            scores = delta[t - 1][:, np.newaxis] + log_A  # (K, K)
+            psi[t] = np.argmax(scores, axis=0)
+            delta[t] = np.max(scores, axis=0) + log_B[t]
 
-        # Backtrack to find most likely path
+        # Backtrack
         states = np.zeros(T, dtype=int)
-        states[T-1] = np.argmax(delta[T-1])
-
-        for t in range(T-2, -1, -1):
-            states[t] = psi[t+1, states[t+1]]
+        states[-1] = np.argmax(delta[-1])
+        for t in range(T - 2, -1, -1):
+            states[t] = psi[t + 1, states[t + 1]]
 
         return states
 
-    def _emission_prob(self, obs: np.ndarray, state: int) -> float:
-        """Compute emission probability p(obs | state)."""
-        params = self.emission_params[state]
+    # ------------------------------------------------------------------
+    # Public API: predict_proba (smooth posteriors)
+    # ------------------------------------------------------------------
 
-        try:
-            prob = multivariate_normal.pdf(obs, mean=params['mean'], cov=params['cov'])
-        except:
-            prob = 1e-10  # Numerical stability
+    def predict_proba(self, observations: np.ndarray) -> np.ndarray:
+        """
+        Return smoothed state probabilities γ_t(i) = P(state_t=i | all obs).
 
-        return max(prob, 1e-10)
+        Returns:
+            gamma: (T, K)
+        """
+        if not self.is_fitted:
+            raise RuntimeError("Call fit() before predict_proba().")
 
-    def get_regime_statistics(self, states: np.ndarray, observations: np.ndarray) -> Dict:
-        """Compute statistics for each regime."""
-        stats = {}
+        log_B = self._log_emission_probs(observations)
+        gamma, _, _ = self._e_step(observations, log_B)
+        return gamma
 
-        for k in range(self.n_states):
-            regime_obs = observations[states == k]
-
-            if len(regime_obs) > 0:
-                stats[f'Regime_{k+1}'] = {
-                    'frequency': (states == k).mean(),
-                    'mean_return': regime_obs[:, 0].mean() if regime_obs.shape[1] > 0 else 0,
-                    'volatility': regime_obs[:, 0].std() if regime_obs.shape[1] > 0 else 0,
-                    'duration_days': len(regime_obs) / (states == k).sum() if (states == k).sum() > 0 else 0
-                }
-            else:
-                stats[f'Regime_{k+1}'] = {
-                    'frequency': 0,
-                    'mean_return': 0,
-                    'volatility': 0,
-                    'duration_days': 0
-                }
-
-        return stats
+    def score(self, observations: np.ndarray) -> float:
+        """Return log P(observations | model) — useful for model selection."""
+        if not self.is_fitted:
+            raise RuntimeError("Call fit() before score().")
+        log_B = self._log_emission_probs(observations)
+        _, log_likelihood = self._forward(log_B)
+        return log_likelihood
 
 
 # ---------------------------------------------------------------------------
-# Gaussian Mixture Model
+# Market Regime Feature Engineering
 # ---------------------------------------------------------------------------
 
-def regime_detection_gmm(observations: np.ndarray, n_regimes: int = 4):
+def build_regime_features(prices: pd.Series,
+                           window_vol: int = 21,
+                           window_mom: int = 10) -> pd.DataFrame:
     """
-    Detect regimes using Gaussian Mixture Model.
+    Construct multi-dimensional observations for regime detection.
 
-    GMM is simpler than HMM (no temporal dynamics), but faster.
-    Good for static regime classification.
+    Features:
+        - Realised volatility (21-day)
+        - Momentum (10-day return)
+        - Autocorrelation of daily returns (21-day rolling)
+        - Normalised volume (if available, else skipped)
     """
-    print(f"\n  Detecting Regimes with GMM...")
-    print(f"    Number of regimes: {n_regimes}")
+    ret = prices.pct_change().dropna()
 
-    # Fit GMM
-    gmm = GaussianMixture(n_components=n_regimes, covariance_type='full', random_state=42)
-    gmm.fit(observations)
+    vol = ret.rolling(window_vol).std() * np.sqrt(252)
+    mom = prices.pct_change(window_mom)
+    autocorr = ret.rolling(window_vol).apply(
+        lambda x: pd.Series(x).autocorr(lag=1) if len(x) > 2 else 0.0,
+        raw=False
+    )
 
-    # Predict regimes
-    regimes = gmm.predict(observations)
+    df = pd.DataFrame({
+        'vol': vol,
+        'momentum': mom,
+        'autocorr': autocorr,
+    }).dropna()
 
-    # Compute BIC/AIC for model selection
-    bic = gmm.bic(observations)
-    aic = gmm.aic(observations)
-
-    print(f"    BIC: {bic:.2f} (lower is better)")
-    print(f"    AIC: {aic:.2f} (lower is better)")
-
-    return regimes, gmm
+    return df
 
 
 # ---------------------------------------------------------------------------
-# Regime-Conditional Strategy
+# Regime Labeller (human-readable names)
 # ---------------------------------------------------------------------------
 
-def regime_conditional_strategy(returns: np.ndarray, regimes: np.ndarray):
+def label_regimes(hmm: GaussianHMM_BaumWelch,
+                  regime_names: Optional[List[str]] = None) -> Dict[int, str]:
     """
-    Implement regime-conditional trading strategy.
+    Auto-assign regime names by sorting states on volatility (emission mean[0]).
 
-    Different strategies for different regimes:
-      - Trend regime: Momentum
-      - Range regime: Mean reversion
-      - High-vol regime: Reduce leverage
-      - Crisis regime: Go to cash
+    Convention: state with lowest vol → 'Bull / Low-Vol'
+                state with highest vol → 'Bear / High-Vol'
     """
-    print(f"\n  Evaluating Regime-Conditional Strategy...")
+    if not hmm.is_fitted:
+        raise RuntimeError("Fit HMM first.")
 
-    # Identify regimes by characteristics
-    regime_stats = {}
+    vols = [p['mean'][0] for p in hmm.emission_params]
+    order = np.argsort(vols)  # ascending volatility
 
-    for r in range(regimes.max() + 1):
-        regime_returns = returns[regimes == r]
+    default_names = ['Bull/Low-Vol', 'Transition', 'Bear/High-Vol',
+                     'Crisis', 'Recovery']
 
-        if len(regime_returns) > 0:
-            regime_stats[r] = {
-                'mean': regime_returns.mean(),
-                'vol': regime_returns.std(),
-                'sharpe': regime_returns.mean() / (regime_returns.std() + 1e-8) * np.sqrt(252),
-                'frequency': (regimes == r).mean()
-            }
-        else:
-            regime_stats[r] = {'mean': 0, 'vol': 0, 'sharpe': 0, 'frequency': 0}
+    if regime_names is None:
+        regime_names = default_names
 
-    # Classify regimes
-    regime_labels = {}
-    sorted_regimes = sorted(regime_stats.items(), key=lambda x: x[1]['vol'])
+    labels: Dict[int, str] = {}
+    for rank, state_idx in enumerate(order):
+        labels[int(state_idx)] = regime_names[min(rank, len(regime_names) - 1)]
 
-    regime_labels[sorted_regimes[0][0]] = 'Low-Vol/Range-Bound'
-    regime_labels[sorted_regimes[1][0]] = 'Normal/Trend'
-
-    if len(sorted_regimes) > 2:
-        regime_labels[sorted_regimes[2][0]] = 'High-Vol/Turbulent'
-    if len(sorted_regimes) > 3:
-        regime_labels[sorted_regimes[3][0]] = 'Crisis'
-
-    print(f"\n  Regime Classification:")
-    for r, label in regime_labels.items():
-        stats = regime_stats[r]
-        print(f"    Regime {r+1} ({label}):")
-        print(f"      Frequency:     {stats['frequency']:.1%}")
-        print(f"      Mean Return:   {stats['mean']*252:.1%} annualized")
-        print(f"      Volatility:    {stats['vol']*np.sqrt(252):.1%} annualized")
-        print(f"      Sharpe:        {stats['sharpe']:.2f}")
-
-    # Regime-conditional returns (simplified strategy)
-    conditional_returns = np.zeros_like(returns)
-
-    for t in range(len(returns)):
-        r = regimes[t]
-
-        if regime_labels.get(r) == 'Low-Vol/Range-Bound':
-            # Mean reversion: Reverse yesterday's return
-            if t > 0:
-                conditional_returns[t] = -returns[t-1] * 0.5
-            else:
-                conditional_returns[t] = 0
-
-        elif regime_labels.get(r) == 'Normal/Trend':
-            # Momentum: Follow yesterday's return
-            if t > 0:
-                conditional_returns[t] = returns[t-1] * 1.0
-            else:
-                conditional_returns[t] = 0
-
-        elif regime_labels.get(r) == 'High-Vol/Turbulent':
-            # Reduce leverage
-            conditional_returns[t] = returns[t] * 0.5
-
-        elif regime_labels.get(r) == 'Crisis':
-            # Go to cash
-            conditional_returns[t] = 0
-
-    # Compute performance
-    baseline_sharpe = returns.mean() / (returns.std() + 1e-8) * np.sqrt(252)
-    conditional_sharpe = conditional_returns.mean() / (conditional_returns.std() + 1e-8) * np.sqrt(252)
-
-    print(f"\n  Strategy Performance:")
-    print(f"    Baseline (no regime): Sharpe {baseline_sharpe:.2f}")
-    print(f"    Regime-Conditional:   Sharpe {conditional_sharpe:.2f}")
-    print(f"    Improvement:          {(conditional_sharpe/baseline_sharpe-1):.1%}")
-
-    return {
-        'baseline_sharpe': baseline_sharpe,
-        'conditional_sharpe': conditional_sharpe,
-        'regime_stats': regime_stats,
-        'regime_labels': regime_labels
-    }
+    return labels
 
 
 # ---------------------------------------------------------------------------
-# CLI demonstration
+# Walk-Forward Backtest of Regime Model
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    print("═" * 70)
-    print("  HMM + GMM FOR MARKET REGIME DETECTION")
-    print("  Target: 3-5 Regimes | 85%+ Accuracy")
-    print("═" * 70)
+@dataclass
+class RegimeBacktestResult:
+    states: np.ndarray
+    state_labels: Dict[int, str]
+    regime_returns: Dict[str, pd.Series]
+    transition_matrix: np.ndarray
+    log_likelihood: float
+    regime_stats: pd.DataFrame
 
-    # Generate synthetic market data with regimes
-    print("\n── Generating Synthetic Market Data with Regimes ──")
+
+def backtest_regime_model(prices: pd.Series,
+                          n_states: int = 3,
+                          n_iter: int = 100,
+                          train_frac: float = 0.7) -> RegimeBacktestResult:
+    """
+    Train HMM on first `train_frac` of data, decode full history,
+    and compute per-regime return statistics.
+    """
+    features_df = build_regime_features(prices)
+    scaler = StandardScaler()
+    obs = scaler.fit_transform(features_df.values)
+
+    split = int(len(obs) * train_frac)
+    train_obs = obs[:split]
+
+    # Fit
+    model = GaussianHMM_BaumWelch(n_states=n_states, n_iter=n_iter)
+    model.fit(train_obs)
+
+    # Decode full history
+    all_states = model.predict(obs)
+    labels = label_regimes(model)
+
+    # Align returns with decoded states
+    returns = prices.pct_change().reindex(features_df.index).dropna()
+    regime_returns: Dict[str, pd.Series] = {}
+    rows = []
+    for state_id, label in labels.items():
+        mask = all_states == state_id
+        # align mask to returns index
+        mask_series = pd.Series(mask, index=features_df.index)
+        aligned_mask = mask_series.reindex(returns.index).fillna(False)
+        r = returns[aligned_mask.values]
+        regime_returns[label] = r
+        if len(r) > 0:
+            rows.append({
+                'Regime': label,
+                'State': state_id,
+                'Count': len(r),
+                'Mean Ann. Return': r.mean() * 252,
+                'Ann. Volatility': r.std() * np.sqrt(252),
+                'Sharpe': (r.mean() / r.std() * np.sqrt(252)) if r.std() > 0 else 0,
+                'Max Drawdown': _max_drawdown(r),
+                'Emission Vol': model.emission_params[state_id]['mean'][0],
+            })
+
+    stats_df = pd.DataFrame(rows).set_index('Regime') if rows else pd.DataFrame()
+
+    return RegimeBacktestResult(
+        states=all_states,
+        state_labels=labels,
+        regime_returns=regime_returns,
+        transition_matrix=model.transition_matrix,
+        log_likelihood=model.log_likelihood_history[-1] if model.log_likelihood_history else float('nan'),
+        regime_stats=stats_df,
+    )
+
+
+def _max_drawdown(returns: pd.Series) -> float:
+    cumulative = (1 + returns).cumprod()
+    rolling_max = cumulative.cummax()
+    drawdown = (cumulative - rolling_max) / rolling_max
+    return float(drawdown.min())
+
+
+# ---------------------------------------------------------------------------
+# IC Measurement: do regime labels add alpha?
+# ---------------------------------------------------------------------------
+
+def measure_regime_ic(prices: pd.Series, n_states: int = 3,
+                      forward_period: int = 5) -> Dict[str, float]:
+    """
+    Measure information coefficient between regime probability and
+    forward returns, to assess regime signal quality.
+
+    Returns:
+        {'ic': float, 'ic_t_stat': float, 'hit_rate': float}
+    """
+    features_df = build_regime_features(prices)
+    scaler = StandardScaler()
+    obs = scaler.fit_transform(features_df.values)
+
+    model = GaussianHMM_BaumWelch(n_states=n_states, n_iter=100)
+    model.fit(obs)
+
+    proba = model.predict_proba(obs)  # (T, K)
+    # Use lowest-vol state (bull) probability as the alpha signal
+    labels = label_regimes(model)
+    bull_state = [k for k, v in labels.items() if 'Bull' in v][0]
+    signal = proba[:, bull_state]
+
+    # Forward returns aligned to features index
+    fwd = prices.pct_change(forward_period).shift(-forward_period)
+    fwd = fwd.reindex(features_df.index)
+
+    valid = ~np.isnan(fwd.values)
+    if valid.sum() < 20:
+        return {'ic': float('nan'), 'ic_t_stat': float('nan'), 'hit_rate': float('nan')}
+
+    ic, _ = spearmanr(signal[valid], fwd.values[valid])
+    n = valid.sum()
+    t_stat = ic * np.sqrt(n - 2) / np.sqrt(max(1 - ic ** 2, 1e-10))
+    hit_rate = float(np.mean(np.sign(signal[valid] - 0.5) == np.sign(fwd.values[valid])))
+
+    return {'ic': float(ic), 'ic_t_stat': float(t_stat), 'hit_rate': hit_rate}
+
+
+# ---------------------------------------------------------------------------
+# Model Selection: BIC over n_states
+# ---------------------------------------------------------------------------
+
+def select_n_states(observations: np.ndarray,
+                    candidates: List[int] = None,
+                    n_iter: int = 50) -> Dict[str, object]:
+    """
+    Select optimal number of HMM states via Bayesian Information Criterion.
+
+    BIC = -2 * logL + k * log(T)
+    where k = number of free parameters.
+    """
+    if candidates is None:
+        candidates = [2, 3, 4, 5]
+
+    T, D = observations.shape
+    results = []
+
+    for K in candidates:
+        model = GaussianHMM_BaumWelch(n_states=K, n_iter=n_iter)
+        model.fit(observations)
+        ll = model.score(observations)
+
+        # Free parameters: (K-1) initial probs + K(K-1) transitions
+        #                  + K*D means + K*D*(D+1)/2 covariance entries
+        k_params = ((K - 1)
+                    + K * (K - 1)
+                    + K * D
+                    + K * D * (D + 1) // 2)
+        bic = -2 * ll + k_params * np.log(T)
+        aic = -2 * ll + 2 * k_params
+
+        results.append({'K': K, 'logL': ll, 'BIC': bic, 'AIC': aic,
+                        'n_params': k_params, 'model': model})
+        print(f"  K={K}: logL={ll:.2f}  BIC={bic:.2f}  AIC={aic:.2f}")
+
+    best = min(results, key=lambda x: x['BIC'])
+    print(f"\n  Best K by BIC: {best['K']}")
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Demo
+# ---------------------------------------------------------------------------
+
+if __name__ == '__main__':
+    print("=" * 70)
+    print("HMM Market Regime Detection — Full Baum-Welch EM")
+    print("=" * 70)
 
     np.random.seed(42)
-    n_days = 252 * 5  # 5 years
 
-    # Define 4 regimes with different characteristics
-    regimes_true = []
+    # Simulate a regime-switching price series (3 regimes)
+    T = 500
+    true_states = np.zeros(T, dtype=int)
+    regime_vol = [0.008, 0.015, 0.030]   # bull, transition, bear
+    regime_drift = [0.0005, 0.0001, -0.0005]
+
+    state = 0
+    trans = np.array([[0.97, 0.02, 0.01],
+                      [0.05, 0.90, 0.05],
+                      [0.03, 0.07, 0.90]])
     returns = []
-    volatilities = []
+    for t in range(T):
+        true_states[t] = state
+        r = regime_drift[state] + regime_vol[state] * np.random.randn()
+        returns.append(r)
+        state = np.random.choice(3, p=trans[state])
 
-    # Regime parameters: (mean, vol, persistence)
-    regime_params = [
-        (0.0008, 0.008, 60),   # Low-vol/range-bound (60 day avg duration)
-        (0.0012, 0.012, 80),   # Normal/trending
-        (0.0002, 0.022, 40),   # High-vol/turbulent
-        (-0.0020, 0.035, 20),  # Crisis
-    ]
+    prices = pd.Series(100 * np.exp(np.cumsum(returns)),
+                       index=pd.date_range('2018-01-01', periods=T, freq='B'))
 
-    current_regime = 0
-    days_in_regime = 0
+    # Build and fit HMM
+    result = backtest_regime_model(prices, n_states=3, n_iter=80)
 
-    for day in range(n_days):
-        # Regime switching logic
-        mean_return, vol, persistence = regime_params[current_regime]
+    print("\n  Per-Regime Statistics:")
+    print(result.regime_stats.to_string())
 
-        days_in_regime += 1
+    print("\n  State Labels:", result.regime_stats.index.tolist())
+    print(f"\n  Final Log-Likelihood: {result.log_likelihood:.4f}")
 
-        # Switch regime with some probability
-        if days_in_regime > persistence or np.random.random() < 0.02:
-            # Transition probabilities (self-persistence + random)
-            if current_regime == 3:  # Crisis doesn't last long
-                current_regime = np.random.choice([0, 1], p=[0.5, 0.5])
-            else:
-                # Can transition to any state
-                probs = np.ones(4) * 0.1
-                probs[current_regime] = 0.7  # Self-persistence
-                probs /= probs.sum()
-                current_regime = np.random.choice(4, p=probs)
+    # IC test
+    ic_result = measure_regime_ic(prices, n_states=3, forward_period=5)
+    print(f"\n  Regime Signal IC (5-day forward): {ic_result['ic']:.4f}  "
+          f"(t={ic_result['ic_t_stat']:.2f})")
+    print(f"  Hit Rate: {ic_result['hit_rate']:.2%}")
 
-            days_in_regime = 0
-
-        # Generate return for current regime
-        ret = np.random.normal(mean_return, vol)
-        returns.append(ret)
-        volatilities.append(vol)
-        regimes_true.append(current_regime)
-
-    returns = np.array(returns)
-    volatilities = np.array(volatilities)
-    regimes_true = np.array(regimes_true)
-
-    # Create feature matrix (returns + volatility)
-    rolling_vol = pd.Series(returns).rolling(20).std().fillna(0).values * np.sqrt(252)
-    observations = np.column_stack([returns, rolling_vol])
-
-    print(f"  Time period: {n_days} days ({n_days/252:.1f} years)")
-    print(f"  True regimes: {len(set(regimes_true))}")
-    for r in range(4):
-        freq = (regimes_true == r).mean()
-        print(f"    Regime {r+1}: {freq:.1%} of time")
-
-    # Method 1: HMM
-    print(f"\n{'═' * 70}")
-    print(f"  METHOD 1: HIDDEN MARKOV MODEL (HMM)")
-    print(f"{'═' * 70}")
-
-    hmm = SimplifiedHMM(n_states=4)
-    hmm.fit(observations, n_iter=50)
-
-    regimes_hmm = hmm.predict(observations)
-
-    # Compute accuracy (with optimal alignment)
-    from scipy.optimize import linear_sum_assignment
-    confusion = np.zeros((4, 4))
-    for i in range(4):
-        for j in range(4):
-            confusion[i, j] = np.sum((regimes_true == i) & (regimes_hmm == j))
-
-    row_ind, col_ind = linear_sum_assignment(-confusion)
-    accuracy_hmm = confusion[row_ind, col_ind].sum() / len(regimes_true)
-
-    print(f"\n  HMM Classification Accuracy: {accuracy_hmm:.1%}")
-
-    # Regime statistics
-    regime_stats_hmm = hmm.get_regime_statistics(regimes_hmm, observations)
-
-    print(f"\n  HMM Regime Statistics:")
-    for regime, stats in regime_stats_hmm.items():
-        print(f"    {regime}:")
-        print(f"      Frequency:   {stats['frequency']:.1%}")
-        print(f"      Mean Return: {stats['mean_return']*252:.1%} annualized")
-        print(f"      Volatility:  {stats['volatility']*np.sqrt(252):.1%} annualized")
-
-    # Method 2: GMM
-    print(f"\n{'═' * 70}")
-    print(f"  METHOD 2: GAUSSIAN MIXTURE MODEL (GMM)")
-    print(f"{'═' * 70}")
-
-    regimes_gmm, gmm_model = regime_detection_gmm(observations, n_regimes=4)
-
-    # Compute accuracy
-    confusion_gmm = np.zeros((4, 4))
-    for i in range(4):
-        for j in range(4):
-            confusion_gmm[i, j] = np.sum((regimes_true == i) & (regimes_gmm == j))
-
-    row_ind_gmm, col_ind_gmm = linear_sum_assignment(-confusion_gmm)
-    accuracy_gmm = confusion_gmm[row_ind_gmm, col_ind_gmm].sum() / len(regimes_true)
-
-    print(f"\n  GMM Classification Accuracy: {accuracy_gmm:.1%}")
-
-    # Regime-conditional strategy
-    print(f"\n{'═' * 70}")
-    print(f"  REGIME-CONDITIONAL STRATEGY EVALUATION")
-    print(f"{'═' * 70}")
-
-    strategy_results = regime_conditional_strategy(returns, regimes_hmm)
-
-    # Benchmark comparison
-    print(f"\n{'═' * 70}")
-    print(f"  BENCHMARK COMPARISON (Top 0.01% Standard)")
-    print(f"{'═' * 70}")
-
-    target_accuracy = 0.85
-
-    print(f"\n  {'Metric':<35} {'Target':<15} {'Achieved':<15}")
-    print(f"  {'-' * 65}")
-    print(f"  {'Classification Accuracy (HMM)':<35} {target_accuracy:.0%}{' '*10} {accuracy_hmm:>6.1%}")
-    print(f"  {'Classification Accuracy (GMM)':<35} {target_accuracy:.0%}{' '*10} {accuracy_gmm:>6.1%}")
-    print(f"  {'Sharpe Improvement (Regime-Aware)':<35} {'30%+':<15} {(strategy_results['conditional_sharpe']/strategy_results['baseline_sharpe']-1):>6.1%}")
-
-    status_hmm = '✅ TARGET' if accuracy_hmm >= target_accuracy else '⚠️  APPROACHING'
-    status_gmm = '✅ TARGET' if accuracy_gmm >= target_accuracy else '⚠️  APPROACHING'
-
-    print(f"\n  Status:")
-    print(f"    HMM: {status_hmm}")
-    print(f"    GMM: {status_gmm}")
-
-    print(f"\n{'═' * 70}")
-    print(f"  KEY INSIGHTS FOR $800K+ ROLES")
-    print(f"{'═' * 70}")
-
-    print(f"""
-1. REGIME DETECTION ACCURACY:
-   HMM Accuracy: {accuracy_hmm:.1%}
-   GMM Accuracy: {accuracy_gmm:.1%}
-   Target: 85%+
-   
-   → HMM captures temporal dynamics (transition probabilities)
-   → GMM faster but ignores time structure
-   → Production: Ensemble HMM + GMM for robustness
-
-2. SHARPE IMPROVEMENT FROM REGIME-AWARE STRATEGIES:
-   Baseline Sharpe:     {strategy_results['baseline_sharpe']:.2f}
-   Regime-Aware Sharpe: {strategy_results['conditional_sharpe']:.2f}
-   Improvement:         {(strategy_results['conditional_sharpe']/strategy_results['baseline_sharpe']-1):.0%}
-   
-   → Different strategies for different regimes
-   → Momentum in trends, mean-reversion in range-bound
-   → Cash in crisis (avoids -30%+ drawdowns)
-
-3. WHY 4 REGIMES (NOT 2 OR 10):
-   2 regimes: Too coarse (just "up" vs "down")
-   4 regimes: Optimal (low-vol, normal, high-vol, crisis)
-   10 regimes: Overfitting (regime-switching too frequent)
-   
-   BIC/AIC model selection suggests 3-5 regimes optimal
-
-4. PRODUCTION PATH TO 85%+ ACCURACY:
-   Current (demo): {max(accuracy_hmm, accuracy_gmm):.1%} on synthetic data
-   
-   Production improvements:
-   - More features: VIX, credit spreads, yield curve, sentiment
-   - Deep learning HMM: RNN/LSTM encoder for states
-   - Online learning: Update model parameters daily
-   - Expected: 85-90% accuracy on real regimes
-
-5. REAL-WORLD REGIME EXAMPLES (2000-2024):
-   Regime 1 (Low-Vol): 2003-2007, 2017-2019 (Goldilocks)
-   Regime 2 (Normal): 2010-2011, 2021-2022 (Steady growth)
-   Regime 3 (High-Vol): 2015-2016 (China fears), 2022 (inflation fears)
-   Regime 4 (Crisis): 2008 (GFC), 2020 (COVID), 2022 (Ukraine)
-    """)
-
-print(f"\n{'═' * 70}")
-print(f"  Module complete. Production deployment requires:")
-print(f"  pip install hmmlearn")
-print(f"  from hmmlearn.hmm import GaussianHMM")
-print(f"{'═' * 70}\n")
+    # Model selection
+    print("\n  Model Selection (BIC):")
+    features_df = build_regime_features(prices)
+    scaler = StandardScaler()
+    obs = scaler.fit_transform(features_df.values)
+    best = select_n_states(obs, candidates=[2, 3, 4], n_iter=40)
+    print(f"  Optimal states: {best['K']}")
